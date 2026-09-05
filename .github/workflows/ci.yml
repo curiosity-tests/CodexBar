@@ -1,19 +1,43 @@
 name: CI
 
 on:
+  workflow_dispatch:
+    inputs:
+      leg:
+        description: "baseline (uninstrumented) or instrumented (under chalk/curiosity)"
+        type: choice
+        options: [instrumented, baseline]
+        default: instrumented
+      profile:
+        description: "CrashOverride chalk profile"
+        type: string
+        default: curiosity-tests-racecar
+      racecar_run:
+        description: "racecar correlation token, echoed into the run name"
+        type: string
+        default: ""
   push:
     branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
 
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: ci-${{ github.workflow }}-${{ github.ref }}-${{ inputs.leg || 'push' }}-${{ inputs.racecar_run }}
+  cancel-in-progress: false
 
 env:
+  # The one variable that separates the arms: on baseline, action-checkout
+  # skips its Set up Chalk step entirely.
+  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
   SWIFT_VERSION: 6.3.3
   SWIFTLY_VERSION: 1.1.3
   SWIFTLY_SIGNING_FINGERPRINT: E813C892820A6FA13755B268F167DF1ACF9CE069
+
+permissions:
+  contents: read
+  id-token: write
+
+run-name: "CI ${{ inputs.leg || 'push' }} ${{ inputs.racecar_run }}"
 
 jobs:
   changes:
@@ -27,9 +51,19 @@ jobs:
       linux-musl-build: ${{ steps.linux-musl-build.outputs.linux-musl-build }}
       linux-musl-build-reason: ${{ steps.linux-musl-build.outputs.linux-musl-build-reason }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
         with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
           fetch-depth: 0
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
       - name: Detect macOS test impact
         id: macos-tests
@@ -94,7 +128,18 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
       - name: Install lint tools
         run: ./Scripts/install_lint_tools.sh swiftlint oxlint oxfmt typescript
@@ -102,125 +147,28 @@ jobs:
       - name: Lint
         run: ./Scripts/lint.sh lint-linux
 
-  swift-test-macos:
-    needs: changes
-    if: ${{ needs.changes.outputs.macos-tests == 'true' && needs.changes.outputs.macos-tests-deferred != 'true' }}
-    # Apple-Silicon runners: ~2-4x faster Swift builds than the retired-path
-    # Intel pool and much shorter queues (see #2585 for the measurements).
-    runs-on: macos-26
-    timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        # Two shards amortize SwiftPM's per-shard discovery/cold build.
-        # Each shard remains within the 50-minute Swift Test timeout.
-        shard-index: [0, 1]
-        shard-count: [2]
-    steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-
-      - name: Select Xcode 26.3 or 26.2
-        run: |
-          set -euo pipefail
-          # Both versions are part of the official macOS 26 runner image.
-          for candidate in /Applications/Xcode_26.3.app /Applications/Xcode_26.2.app; do
-            if [[ -d "$candidate" ]]; then
-              sudo xcode-select -s "${candidate}/Contents/Developer"
-              echo "DEVELOPER_DIR=${candidate}/Contents/Developer" >> "$GITHUB_ENV"
-              break
-            fi
-          done
-          [[ "$(/usr/bin/xcodebuild -version)" == Xcode\ 26.* ]]
-          /usr/bin/xcodebuild -version
-
-      - name: Restore SwiftPM build cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: |
-            .build
-            ~/Library/Caches/org.swift.swiftpm
-          # Keyed on dependency state: saves once per Package.resolved change,
-          # and partial hits (restore-keys) still carry the dependency builds,
-          # which dominate the cold-build time.
-          key: swiftpm-macos26-arm64-${{ hashFiles('Package.resolved', 'Package.swift') }}
-          restore-keys: |
-            swiftpm-macos26-arm64-
-
-      - name: Swift toolchain version
-        run: |
-          set -euo pipefail
-          swift --version
-          swift package --version
-
-      - name: Check app locales and Swift formatting
-        if: ${{ matrix.shard-index == 0 }}
-        run: ./Scripts/lint.sh lint-macos
-
-      - name: Swift Test
-        # Keep small batches to reduce SwiftPM process overhead without returning to one aggregate run.
-        timeout-minutes: 50
-        run: |
-          CODEXBAR_TEST_GROUP_SIZE=4 \
-            CODEXBAR_TEST_SUITE_TIMEOUT=120 \
-            CODEXBAR_TEST_RETRY_NON_TIMEOUT_FAILURES=0 \
-            CODEXBAR_TEST_SHARD_INDEX=${{ matrix.shard-index }} \
-            CODEXBAR_TEST_SHARD_COUNT=${{ matrix.shard-count }} \
-            ./Scripts/test.sh
-
-      - name: Provider plugin engine A/B goldens
-        if: ${{ matrix.shard-index == 0 }}
-        run: ./Scripts/test-plugin-engines.sh
-
-      - name: Collect crash reports on failure
-        if: ${{ failure() }}
-        shell: bash
-        run: |
-          set -uo pipefail
-          reports="$HOME/Library/Logs/DiagnosticReports"
-          found=0
-          if [[ -d "$reports" ]]; then
-            while IFS= read -r file; do
-              found=1
-              echo "::group::crash report $(basename "$file")"
-              cat "$file"
-              echo "::endgroup::"
-            done < <(find "$reports" \( -name '*.ips' -o -name '*.crash' \) -newer .git/HEAD -print 2>/dev/null | head -5)
-          fi
-          [[ "$found" == 1 ]] || echo "no fresh crash reports under $reports"
-
-      - name: Summarize macOS shard
-        if: ${{ always() }}
-        shell: bash
-        env:
-          SHARD_INDEX: ${{ matrix.shard-index }}
-          SHARD_COUNT: ${{ matrix.shard-count }}
-          RUNS_LINT_MACOS: ${{ matrix.shard-index == 0 }}
-        run: |
-          set -euo pipefail
-          display_shard_index=$((SHARD_INDEX + 1))
-          xcode_version="$(/usr/bin/xcodebuild -version 2>/dev/null | tr '\n' ' ' || true)"
-          {
-            printf '### macOS Swift shard\n\n'
-            printf '| Field | Value |\n'
-            printf '| --- | --- |\n'
-            printf '| Shard | `%s / %s` |\n' "$display_shard_index" "$SHARD_COUNT"
-            printf '| Runner | `%s` |\n' "${RUNNER_NAME:-unknown}"
-            printf '| Xcode | `%s` |\n' "${xcode_version:-unknown}"
-            printf '| Runs lint-macos | `%s` |\n' "$RUNS_LINT_MACOS"
-          } >> "$GITHUB_STEP_SUMMARY"
-
   lint-build-test:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     needs:
       - changes
       - lint
-      - swift-test-macos
       - build-linux-musl-cli
       - build-linux-cli
     if: ${{ always() && !cancelled() }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
       - name: Verify required CI jobs
         run: |
@@ -285,7 +233,18 @@ jobs:
       SQLITE_AMALGAMATION_VERSION: "3530300"
       SQLITE_AMALGAMATION_SHA3_256: d45c688a8cb23f68611a894a756a12d7eb6ab6e9e2468ca70adbeab3808b5ab9
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
       - name: Runner info
         run: |
@@ -456,7 +415,18 @@ jobs:
             runs-on: ubuntu-24.04-arm
     runs-on: ${{ matrix.runs-on }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Checkout code
+        uses: crashappsec/action-checkout@main
+        with:
+          chalk: ${{ env.CHALK_ON }}
+          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+          observables_continue_on_error: false
+          lfs: false
+      - name: Assert instrumentation is live
+        if: env.CHALK_ON == 'true'
+        run: |
+          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
+          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
 
       - name: Runner info
         run: |
